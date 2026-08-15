@@ -88,8 +88,10 @@ The installer:
 - validates every input and output EDID checksum;
 - strips stale CTA extensions while preserving DisplayID data;
 - generates the tested BT.2020/DCI-P3 and HDR static metadata;
-- creates a timestamped backup under
+- creates a unique timestamped backup under
   `/var/lib/razer-oled-brightness-fix`;
+- preserves the first unmodified backup as the rollback baseline across
+  repeated installs;
 - installs `/lib/firmware/edid/oled-hdr.bin`;
 - adds the firmware to mkinitcpio;
 - adds `drm.edid_firmware=eDP-1:edid/oled-hdr.bin` to Limine; and
@@ -239,7 +241,7 @@ control the OLED.
 
 ## Rollback
 
-Restore the latest pre-install system backup:
+Restore the original pre-install system baseline:
 
 ```bash
 ./razer-oled-brightness-fix.sh restore

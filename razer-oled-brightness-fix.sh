@@ -13,6 +13,7 @@ readonly MKINITCPIO_CONFIG="${TEST_ROOT}/etc/mkinitcpio.conf"
 readonly LIMINE_CONFIG="${TEST_ROOT}/etc/default/limine"
 readonly STATE_ROOT="${TEST_ROOT}/var/lib/razer-oled-brightness-fix"
 readonly LIMINE_UPDATE="${RAZER_OLED_LIMINE_UPDATE:-limine-update}"
+ORIGINAL_ARGS=("$@")
 
 ACTION="diagnose"
 DRY_RUN=0
@@ -20,6 +21,8 @@ FORCE_MODEL=0
 LAST_BACKUP=""
 EDID_PATH=""
 CONNECTOR=""
+GENERATED_EDID=""
+DECODED_EDID=""
 
 info() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
@@ -33,7 +36,7 @@ Usage: ${PROGRAM} [diagnose|install|restore] [options]
 Actions:
   diagnose                  Collect read-only OLED, EDID, and compositor data
   install                   Install the guarded EDID firmware override
-  restore                   Restore the most recent pre-install backup
+  restore                   Restore the original pre-install baseline
 
 Options:
   --dry-run                 Print privileged changes without applying them
@@ -80,6 +83,27 @@ capture_root() {
     sudo "$@"
   fi
 }
+
+cleanup() {
+  [[ -z "$GENERATED_EDID" ]] || rm -f "$GENERATED_EDID"
+  [[ -z "$DECODED_EDID" ]] || rm -f "$DECODED_EDID"
+}
+
+prepare_mutation() {
+  ((DRY_RUN)) && return
+  have flock || die "required command not found: flock"
+
+  if [[ -z "$TEST_ROOT" ]] && ((EUID != 0)); then
+    have sudo || die "sudo is required"
+    exec sudo -- "${SCRIPT_DIR}/${PROGRAM}" "${ORIGINAL_ARGS[@]}"
+  fi
+
+  mkdir -p "$STATE_ROOT"
+  exec 8>"${STATE_ROOT}/operation.lock"
+  flock -n 8 || die "another install or restore operation is running"
+}
+
+trap cleanup EXIT
 
 read_product() {
   if [[ -r /sys/class/dmi/id/product_name ]]; then
@@ -133,20 +157,35 @@ require_install_environment() {
 make_backup() {
   local stamp state_file firmware_existed=0
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  LAST_BACKUP="${STATE_ROOT}/backup-${stamp}"
   state_file="$(mktemp)"
 
   [[ -e "$FIRMWARE" ]] && firmware_existed=1
   printf 'FIRMWARE_EXISTED=%d\n' "$firmware_existed" >"$state_file"
 
+  if ((DRY_RUN)); then
+    LAST_BACKUP="${STATE_ROOT}/backup-${stamp}-XXXXXX"
+    print_command sudo mkdir -p "$STATE_ROOT"
+    print_command sudo mktemp -d "${STATE_ROOT}/backup-${stamp}-XXXXXX"
+  else
+    run_root mkdir -p "$STATE_ROOT"
+    LAST_BACKUP="$(
+      capture_root mktemp -d "${STATE_ROOT}/backup-${stamp}-XXXXXX"
+    )"
+  fi
+
   info "Creating backup at ${LAST_BACKUP}"
-  run_root mkdir -p "$LAST_BACKUP"
   run_root cp -a "$MKINITCPIO_CONFIG" "${LAST_BACKUP}/mkinitcpio.conf"
   run_root cp -a "$LIMINE_CONFIG" "${LAST_BACKUP}/limine"
   if ((firmware_existed)); then
     run_root cp -a "$FIRMWARE" "${LAST_BACKUP}/oled-hdr.bin"
   fi
   run_root install -m 600 "$state_file" "${LAST_BACKUP}/state"
+
+  if ((DRY_RUN)); then
+    print_command sudo ln -s "$LAST_BACKUP" "${STATE_ROOT}/baseline"
+  elif ! capture_root test -e "${STATE_ROOT}/baseline"; then
+    run_root ln -s "$LAST_BACKUP" "${STATE_ROOT}/baseline"
+  fi
   run_root ln -sfn "$LAST_BACKUP" "${STATE_ROOT}/latest"
   rm -f "$state_file"
 }
@@ -155,19 +194,21 @@ append_initramfs_file() {
   run_root python3 - "$MKINITCPIO_CONFIG" "$FIRMWARE_PATH" <<'PY'
 import pathlib
 import re
+import shlex
 import sys
 
 path = pathlib.Path(sys.argv[1])
 firmware = sys.argv[2]
 text = path.read_text()
-if firmware in text:
-    raise SystemExit(0)
 pattern = re.compile(r"^FILES=\(([^)]*)\)$", re.MULTILINE)
 match = pattern.search(text)
 if not match:
     raise SystemExit(f"error: cannot parse FILES=() in {path}")
-current = match.group(1).strip()
-replacement = f"FILES=({current + ' ' if current else ''}{firmware})"
+tokens = shlex.split(match.group(1))
+if firmware in tokens:
+    raise SystemExit(0)
+tokens.append(firmware)
+replacement = "FILES=(" + " ".join(shlex.quote(token) for token in tokens) + ")"
 path.write_text(pattern.sub(replacement, text, count=1))
 PY
 }
@@ -177,13 +218,12 @@ append_limine_argument() {
   run_root python3 - "$LIMINE_CONFIG" "$argument" <<'PY'
 import pathlib
 import re
+import shlex
 import sys
 
 path = pathlib.Path(sys.argv[1])
 argument = sys.argv[2]
 text = path.read_text()
-if argument in text:
-    raise SystemExit(0)
 pattern = re.compile(
     r'^(KERNEL_CMDLINE\[default\]\+?=")([^"]*)(")$',
     re.MULTILINE,
@@ -191,8 +231,15 @@ pattern = re.compile(
 match = pattern.search(text)
 if not match:
     raise SystemExit(f"error: cannot parse default kernel command line in {path}")
-arguments = match.group(2).strip()
-replacement = f"{match.group(1)}{arguments} {argument}{match.group(3)}"
+arguments = shlex.split(match.group(2))
+if argument in arguments:
+    raise SystemExit(0)
+arguments.append(argument)
+replacement = (
+    f"{match.group(1)}"
+    + " ".join(shlex.quote(item) for item in arguments)
+    + f"{match.group(3)}"
+)
 path.write_text(pattern.sub(replacement, text, count=1))
 PY
 }
@@ -272,27 +319,25 @@ PY
 }
 
 install_fix() {
-  local generated decoded
   check_model
   require_install_environment
   find_panel_edid
-  generated="$(mktemp --suffix=.bin)"
-  decoded="$(mktemp)"
-  trap 'rm -f "${generated:-}" "${decoded:-}"' EXIT
+  GENERATED_EDID="$(mktemp --suffix=.bin)"
+  DECODED_EDID="$(mktemp)"
 
   info "Building guarded EDID override from ${EDID_PATH}"
-  python3 "$BUILDER" "$generated" "$EDID_PATH"
-  edid-decode "$generated" >"$decoded"
-  grep -Fq "CTA-861 Extension Block" "$decoded" ||
+  python3 "$BUILDER" "$GENERATED_EDID" "$EDID_PATH"
+  edid-decode "$GENERATED_EDID" >"$DECODED_EDID"
+  grep -Fq "CTA-861 Extension Block" "$DECODED_EDID" ||
     die "generated EDID lacks CTA-861 extension"
-  grep -Fq "HDR Static Metadata Data Block" "$decoded" ||
+  grep -Fq "HDR Static Metadata Data Block" "$DECODED_EDID" ||
     die "generated EDID lacks HDR metadata"
-  grep -Fq "BT2020RGB" "$decoded" ||
+  grep -Fq "BT2020RGB" "$DECODED_EDID" ||
     die "generated EDID lacks BT.2020 colorimetry"
 
   make_backup
   info "Installing ${FIRMWARE}"
-  run_root install -D -m 644 "$generated" "$FIRMWARE"
+  run_root install -D -m 644 "$GENERATED_EDID" "$FIRMWARE"
   append_initramfs_file
   append_limine_argument
   info "Rebuilding Limine entries and initramfs images"
@@ -304,8 +349,8 @@ install_fix() {
 
 restore_latest() {
   local backup state firmware_existed=0
-  backup="$(capture_root readlink -f "${STATE_ROOT}/latest" 2>/dev/null || true)"
-  [[ -n "$backup" ]] || die "no backup found under ${STATE_ROOT}"
+  backup="$(capture_root readlink -f "${STATE_ROOT}/baseline" 2>/dev/null || true)"
+  [[ -n "$backup" ]] || die "no original baseline found under ${STATE_ROOT}"
   state="${backup}/state"
   firmware_existed="$(
     capture_root awk -F= '
@@ -329,6 +374,6 @@ restore_latest() {
 
 case "$ACTION" in
   diagnose) diagnose ;;
-  install) install_fix ;;
-  restore) restore_latest ;;
+  install) prepare_mutation; install_fix ;;
+  restore) prepare_mutation; restore_latest ;;
 esac

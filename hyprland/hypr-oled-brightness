@@ -66,6 +66,7 @@ brightness = percent / 100
 
 # Keep every saved layout consistent when hyprmoncfg is in use.
 if profile_dir.is_dir():
+    updates = []
     for path in profile_dir.glob("*.json"):
         with path.open() as stream:
             profile = json.load(stream)
@@ -75,11 +76,21 @@ if profile_dir.is_dir():
                 output["sdr_brightness"] = brightness
                 changed = True
         if changed:
+            updates.append((path, profile))
+
+    temporary_files = []
+    try:
+        for path, profile in updates:
             temporary = path.with_suffix(path.suffix + ".tmp")
             with temporary.open("w") as stream:
                 json.dump(profile, stream, indent=2)
                 stream.write("\n")
+            temporary_files.append((temporary, path))
+        for temporary, path in temporary_files:
             temporary.replace(path)
+    finally:
+        for temporary, _ in temporary_files:
+            temporary.unlink(missing_ok=True)
 
 print(percent)
 PY
