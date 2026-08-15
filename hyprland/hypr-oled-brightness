@@ -1,0 +1,106 @@
+#!/bin/sh
+set -eu
+
+PANEL_KEY="${PANEL_KEY:-samsung display corp.|atna60hu06-0}"
+PANEL_DESCRIPTION="${PANEL_DESCRIPTION:-Samsung Display Corp. ATNA60HU06-0}"
+BACKLIGHT_DEVICE="${BACKLIGHT_DEVICE:-intel_backlight}"
+PROFILE_DIR="${HYPRMONCFG_PROFILE_DIR:-$HOME/.config/hyprmoncfg/profiles}"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/hypr-oled-brightness.lock"
+
+usage() {
+    echo "usage: hypr-oled-brightness up|down|max|set PERCENT" >&2
+    exit 2
+}
+
+[ "$#" -ge 1 ] || usage
+
+for command in flock hyprctl python3 busctl; do
+    command -v "$command" >/dev/null 2>&1 || {
+        echo "error: required command not found: $command" >&2
+        exit 1
+    }
+done
+
+# Repeated key events must not queue hundreds of stale brightness changes.
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+
+percent=$(
+    python3 - "$PROFILE_DIR" "$PANEL_KEY" "$PANEL_DESCRIPTION" "$@" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+profile_dir = pathlib.Path(sys.argv[1])
+panel_key = sys.argv[2]
+panel_description = sys.argv[3]
+action = sys.argv[4]
+
+monitors = json.loads(subprocess.check_output(["hyprctl", "monitors", "-j"]))
+monitor = next(
+    (
+        item
+        for item in monitors
+        if item.get("description", "").strip() == panel_description
+    ),
+    None,
+)
+if monitor is None:
+    raise SystemExit(f"error: panel not connected: {panel_description}")
+current = round(float(monitor.get("sdrBrightness", 1)) * 100)
+
+if action == "up":
+    percent = current + 5
+elif action == "down":
+    percent = current - 5
+elif action == "max":
+    percent = 100
+elif action == "set" and len(sys.argv) == 6:
+    percent = int(sys.argv[5])
+else:
+    raise SystemExit("error: expected up, down, max, or set PERCENT")
+
+percent = max(5, min(100, percent))
+brightness = percent / 100
+
+# Keep every saved layout consistent when hyprmoncfg is in use.
+if profile_dir.is_dir():
+    for path in profile_dir.glob("*.json"):
+        with path.open() as stream:
+            profile = json.load(stream)
+        changed = False
+        for output in profile.get("outputs", []):
+            if output.get("key") == panel_key:
+                output["sdr_brightness"] = brightness
+                changed = True
+        if changed:
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            with temporary.open("w") as stream:
+                json.dump(profile, stream, indent=2)
+                stream.write("\n")
+            temporary.replace(path)
+
+print(percent)
+PY
+)
+
+brightness=$(awk "BEGIN { printf \"%.2f\", $percent / 100 }")
+hyprctl eval "hl.monitor({
+  output = \"desc:$PANEL_DESCRIPTION\",
+  sdrbrightness = $brightness,
+})" >/dev/null
+
+# The OLED has no hardware backlight, but mirroring the percentage through
+# logind updates desktop brightness state and triggers the normal OSD.
+backlight="/sys/class/backlight/$BACKLIGHT_DEVICE"
+if [ -r "$backlight/max_brightness" ]; then
+    max_brightness=$(cat "$backlight/max_brightness")
+    native_brightness=$((max_brightness * percent / 100))
+    busctl --timeout=1s call \
+        org.freedesktop.login1 \
+        /org/freedesktop/login1/session/auto \
+        org.freedesktop.login1.Session \
+        SetBrightness ssu backlight "$BACKLIGHT_DEVICE" "$native_brightness" \
+        >/dev/null || true
+fi
